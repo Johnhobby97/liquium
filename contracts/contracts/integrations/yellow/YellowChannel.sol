@@ -2,6 +2,10 @@
 pragma solidity ^0.8.27;
 
 import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import "../../core/ChannelRegistry.sol";
 
 /**
@@ -21,6 +25,10 @@ import "../../core/ChannelRegistry.sol";
  * - Scalable: Unlimited throughput via channels
  */
 contract YellowChannel is Ownable2Step {
+    using SafeERC20 for IERC20;
+    using ECDSA for bytes32;
+    using MessageHashUtils for bytes32;
+
     /// @notice Channel registry for state management
     ChannelRegistry public immutable channelRegistry;
 
@@ -42,8 +50,24 @@ contract YellowChannel is Ownable2Step {
         uint256 timeout;            // Timeout for disputes
     }
 
+    /// @notice Channel custody data (AssetHolder pattern)
+    struct ChannelAssets {
+        address party0;             // First party
+        address party1;             // Second party
+        address token;              // Asset token
+        uint256 totalDeposited;     // Total deposited
+        bool settled;               // Settlement complete
+        uint256 challengeDeadline;  // Challenge window end
+    }
+
     /// @notice Mapping from channel ID to commitment
     mapping(bytes32 => ChannelCommitment) public commitments;
+
+    /// @notice Mapping from channel ID to assets (AssetHolder)
+    mapping(bytes32 => ChannelAssets) public channelAssets;
+
+    /// @notice Challenge period duration (1 day)
+    uint256 public constant CHALLENGE_PERIOD = 1 days;
 
     /// @notice Events
     event YellowChannelOpened(
@@ -131,6 +155,50 @@ contract YellowChannel is Ownable2Step {
     }
 
     /**
+     * @notice Deposit assets to channel (AssetHolder pattern)
+     * @param channelId Channel identifier
+     * @param token Token address
+     * @param amount Amount to deposit
+     */
+    function depositToChannel(
+        bytes32 channelId,
+        address token,
+        uint256 amount
+    ) external onlyOwner {
+        ChannelAssets storage assets = channelAssets[channelId];
+        
+        // Transfer tokens to this contract (custody)
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        
+        assets.token = token;
+        assets.totalDeposited += amount;
+    }
+
+    /**
+     * @notice Verify dual signatures for state update
+     * @param stateHash Hash of the state being signed
+     * @param party0 Address of first party
+     * @param party1 Address of second party
+     * @param signature0 Signature from party0
+     * @param signature1 Signature from party1
+     * @return True if both signatures are valid
+     */
+    function verifySignatures(
+        bytes32 stateHash,
+        address party0,
+        address party1,
+        bytes memory signature0,
+        bytes memory signature1
+    ) public pure returns (bool) {
+        bytes32 ethSignedHash = stateHash.toEthSignedMessageHash();
+        
+        address signer0 = ethSignedHash.recover(signature0);
+        address signer1 = ethSignedHash.recover(signature1);
+        
+        return signer0 == party0 && signer1 == party1;
+    }
+
+    /**
      * @notice Commit new state to channel
      * @param channelId Channel identifier
      * @param newStateHash New state hash
@@ -150,11 +218,14 @@ contract YellowChannel is Ownable2Step {
         bytes calldata signature1
     ) external {
         ChannelCommitment storage commitment = commitments[channelId];
+        ChannelAssets storage assets = channelAssets[channelId];
         
         if (newNonce <= commitment.nonce) revert CommitmentTooOld();
         
-        // TODO: Verify signatures match parties
-        // In production, would verify ECDSA signatures
+        // Verify dual signatures
+        if (!verifySignatures(newStateHash, assets.party0, assets.party1, signature0, signature1)) {
+            revert InvalidSignature();
+        }
 
         // Update commitment
         commitment.stateHash = newStateHash;
@@ -171,19 +242,67 @@ contract YellowChannel is Ownable2Step {
     }
 
     /**
-     * @notice Finalize and settle channel
+     * @notice Withdraw from channel after settlement
+     * @param channelId Channel identifier
+     * @param party Address to withdraw to
+     * @param amount Amount to withdraw
+     */
+    function withdrawFromChannel(
+        bytes32 channelId,
+        address party,
+        uint256 amount
+    ) external onlyOwner {
+        ChannelAssets storage assets = channelAssets[channelId];
+        
+        require(assets.settled, "Channel not settled");
+        require(block.timestamp >= assets.challengeDeadline, "Challenge period active");
+        
+        // Transfer tokens from custody
+        IERC20(assets.token).safeTransfer(party, amount);
+    }
+
+    /**
+     * @notice Finalize and settle channel with token transfers
      * @param channelId Channel identifier
      */
     function settleChannel(bytes32 channelId) external {
         ChannelCommitment storage commitment = commitments[channelId];
+        ChannelAssets storage assets = channelAssets[channelId];
         
         // Finalize in registry
         channelRegistry.finalizeChannel(channelId, commitment.stateHash);
 
-        // Wait for challenge period, then close
-        // In production, this would trigger actual token transfers
+        // Set challenge deadline (1 day from now)
+        assets.challengeDeadline = block.timestamp + CHALLENGE_PERIOD;
+        
+        // Mark as pending settlement (not yet settled due to challenge period)
+        // After challenge period, withdrawFromChannel can be called
 
         emit ChannelSettled(channelId, commitment.balance0, commitment.balance1);
+    }
+
+    /**
+     * @notice Complete settlement after challenge period
+     * @param channelId Channel identifier
+     * @dev Transfers final balances to parties after challenge period
+     */
+    function completeSettlement(bytes32 channelId) external {
+        ChannelCommitment storage commitment = commitments[channelId];
+        ChannelAssets storage assets = channelAssets[channelId];
+        
+        require(!assets.settled, "Already settled");
+        require(block.timestamp >= assets.challengeDeadline, "Challenge period active");
+        
+        // Mark as settled
+        assets.settled = true;
+        
+        // Transfer final balances
+        if (commitment.balance0 > 0) {
+            IERC20(assets.token).safeTransfer(assets.party0, commitment.balance0);
+        }
+        if (commitment.balance1 > 0) {
+            IERC20(assets.token).safeTransfer(assets.party1, commitment.balance1);
+        }
     }
 
     /**
