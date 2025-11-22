@@ -84,6 +84,18 @@ contract DealPosition is ERC721, ERC721Enumerable, Ownable2Step {
     }
 
     /**
+     * @notice Mark a position as claimed without burning
+     * @param tokenId Token ID to mark as claimed
+     * @dev Used when position is claimed but NFT kept as receipt
+     */
+    function markClaimed(uint256 tokenId) external {
+        if (!authorizedVaults[msg.sender]) revert UnauthorizedVault();
+        if (positions[tokenId].claimed) revert PositionAlreadyClaimed();
+
+        positions[tokenId].claimed = true;
+    }
+
+    /**
      * @notice Burn a position NFT when claimed
      * @param tokenId Token ID to burn
      */

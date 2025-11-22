@@ -20,7 +20,8 @@ contract DealVault is Ownable2Step, ReentrancyGuard {
     /// @notice Deal status
     enum DealStatus {
         Active,
-        Finalizing,
+        Locked,        // Deal locked, no new deposits allowed
+        Settling,      // Settlement in progress with channel proof
         Finalized,
         Cancelled
     }
@@ -59,6 +60,9 @@ contract DealVault is Ownable2Step, ReentrancyGuard {
     /// @notice Mapping from position token ID to deal ID
     mapping(uint256 => uint256) public positionDeals;
 
+    /// @notice Mapping from token address to FTSO symbol
+    mapping(address => string) public tokenSymbols;
+
     /// @notice Protocol fee in basis points (100 = 1%)
     uint256 public protocolFeeBps = 100;
 
@@ -79,11 +83,20 @@ contract DealVault is Ownable2Step, ReentrancyGuard {
         uint256 targetChainId,
         uint256 duration
     );
+    event DealLocked(uint256 indexed dealId, bytes32 indexed channelId);
+    event DealSettling(uint256 indexed dealId, uint256 finalPnL);
     event Deposited(
         uint256 indexed dealId,
         address indexed depositor,
         uint256 indexed positionId,
         uint256 amount
+    );
+    event PositionClaimed(
+        uint256 indexed dealId,
+        uint256 indexed positionId,
+        address indexed recipient,
+        uint256 principal,
+        uint256 yield
     );
     event Withdrawn(
         uint256 indexed dealId,
@@ -100,13 +113,17 @@ contract DealVault is Ownable2Step, ReentrancyGuard {
     /// @notice Custom errors
     error InvalidDeal();
     error DealNotActive();
+    error DealNotLocked();
+    error DealNotSettling();
     error DealNotFinalized();
     error InvalidDepositAmount();
     error InvalidDuration();
     error InvalidPosition();
+    error InvalidChannelProof();
     error PositionAlreadyClaimed();
     error DealStillActive();
     error UnauthorizedWithdrawal();
+    error ChannelNotLinked();
 
     /**
      * @notice Constructor
@@ -251,6 +268,162 @@ contract DealVault is Ownable2Step, ReentrancyGuard {
         }
 
         emit Withdrawn(dealId, positionId, msg.sender, position.depositAmount, netYield);
+    }
+
+    /**
+     * @notice Lock a deal to prevent new deposits
+     * @param dealId Deal identifier
+     * @dev Opens Yellow channel and transitions to Locked state
+     */
+    function lockDeal(uint256 dealId) external onlyOwner {
+        Deal storage deal = deals[dealId];
+        
+        if (deal.status != DealStatus.Active) revert DealNotActive();
+        if (deal.channelId == bytes32(0)) revert ChannelNotLinked();
+        
+        // Transition to Locked state
+        deal.status = DealStatus.Locked;
+        
+        emit DealLocked(dealId, deal.channelId);
+    }
+
+    /**
+     * @notice Settle a deal with channel proof and compute final PnL
+     * @param dealId Deal identifier
+     * @param channelProof Proof from Yellow channel settlement
+     * @dev Validates channel proof, computes PnL using FTSO, transitions to Settling
+     */
+    function settleDeal(uint256 dealId, bytes calldata channelProof) external onlyOwner {
+        Deal storage deal = deals[dealId];
+        
+        if (deal.status != DealStatus.Locked) revert DealNotLocked();
+        if (deal.channelId == bytes32(0)) revert ChannelNotLinked();
+        
+        // Validate channel proof (simplified - in production would verify signatures)
+        if (channelProof.length < 32) revert InvalidChannelProof();
+        
+        // Compute final PnL using FTSO prices
+        uint256 finalPnL = _computeFinalPnL(dealId);
+        
+        // Transition to Settling state
+        deal.status = DealStatus.Settling;
+        
+        emit DealSettling(dealId, finalPnL);
+    }
+
+    /**
+     * @notice Claim position returns after settlement
+     * @param positionId Position NFT ID
+     * @dev Separate from withdraw - allows claiming without burning NFT immediately
+     */
+    function claimPosition(uint256 positionId) external nonReentrant {
+        // Verify ownership
+        if (positionNFT.ownerOf(positionId) != msg.sender) {
+            revert UnauthorizedWithdrawal();
+        }
+
+        uint256 dealId = positionDeals[positionId];
+        Deal storage deal = deals[dealId];
+
+        if (deal.status != DealStatus.Settling && deal.status != DealStatus.Finalized) {
+            revert DealNotSettling();
+        }
+
+        // Get position data
+        DealPosition.Position memory position = positionNFT.getPosition(positionId);
+        if (position.claimed) revert PositionAlreadyClaimed();
+
+        // Compute actual PnL using FTSO prices
+        uint256 yieldAmount = _computePositionYield(dealId, position.depositAmount);
+        
+        // Calculate protocol fee
+        uint256 fee = (yieldAmount * protocolFeeBps) / 10000;
+        uint256 netYield = yieldAmount - fee;
+
+        // Total to claim
+        uint256 totalAmount = position.depositAmount + netYield;
+
+        // Mark as claimed (but don't burn NFT yet)
+        positionNFT.markClaimed(positionId);
+
+        // Transfer tokens
+        IERC20(deal.depositToken).safeTransfer(msg.sender, totalAmount);
+        
+        if (fee > 0) {
+            IERC20(deal.depositToken).safeTransfer(feeRecipient, fee);
+        }
+
+        emit PositionClaimed(dealId, positionId, msg.sender, position.depositAmount, netYield);
+    }
+
+    /**
+     * @notice Set FTSO symbol for token address
+     * @param tokenAddress Token contract address
+     * @param symbol FTSO symbol (e.g., "USDC", "BTC", "ETH")
+     */
+    function setTokenSymbol(address tokenAddress, string memory symbol) external onlyOwner {
+        tokenSymbols[tokenAddress] = symbol;
+    }
+
+    /**
+     * @notice Batch set token symbols
+     * @param tokenAddresses Array of token addresses
+     * @param symbols Array of FTSO symbols
+     */
+    function setTokenSymbols(
+        address[] memory tokenAddresses,
+        string[] memory symbols
+    ) external onlyOwner {
+        require(tokenAddresses.length == symbols.length, "Length mismatch");
+        for (uint256 i = 0; i < tokenAddresses.length; i++) {
+            tokenSymbols[tokenAddresses[i]] = symbols[i];
+        }
+    }
+
+    /**
+     * @notice Compute final PnL using FTSO price feeds
+     * @param dealId Deal identifier
+     * @return Final PnL in basis points
+     */
+    function _computeFinalPnL(uint256 dealId) internal view returns (uint256) {
+        Deal storage deal = deals[dealId];
+        
+        // Get FTSO symbols for tokens
+        string memory depositSymbol = tokenSymbols[deal.depositToken];
+        string memory targetSymbol = tokenSymbols[deal.targetToken];
+        
+        // If symbols not configured, use expected yield
+        if (bytes(depositSymbol).length == 0 || bytes(targetSymbol).length == 0) {
+            return deal.expectedYield;
+        }
+        
+        // Get price ratio from FTSO
+        try priceReader.getPriceRatio(depositSymbol, targetSymbol) returns (
+            uint256 ratio,
+            uint256 /* timestamp */
+        ) {
+            // Calculate actual yield based on price movement
+            // ratio > 1e18 means depositToken gained value vs targetToken
+            if (ratio > 1e18) {
+                return ((ratio - 1e18) * 10000) / 1e18; // Convert to basis points
+            }
+            // If ratio <= 1e18, no positive yield
+            return 0;
+        } catch {
+            // Fallback to expected yield if price feed fails
+            return deal.expectedYield;
+        }
+    }
+
+    /**
+     * @notice Compute position-specific yield
+     * @param dealId Deal identifier
+     * @param depositAmount Position deposit amount
+     * @return Yield amount in deposit token
+     */
+    function _computePositionYield(uint256 dealId, uint256 depositAmount) internal view returns (uint256) {
+        uint256 finalPnL = _computeFinalPnL(dealId);
+        return (depositAmount * finalPnL) / 10000;
     }
 
     /**
