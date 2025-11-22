@@ -1,0 +1,247 @@
+// Liquium Backend Database Schema
+// PostgreSQL database for multi-chain deal management
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===== Deals =====
+model Deal {
+  id                BigInt          @id
+  depositToken      String          // ERC-20 token address
+  targetToken       String          // Trading target token
+  targetChainId     BigInt          // Chain ID for target
+  status            DealStatus      @default(CREATED)
+  totalDeposited    Decimal         @db.Decimal(78, 0)
+  expectedYield     Decimal         @db.Decimal(10, 2)
+  lockTimestamp     DateTime?
+  expiryTimestamp   DateTime?
+  dealer            String          // Dealer address
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  
+  // Relations
+  positions         Position[]
+  channelState      ChannelState?
+  settlements       Settlement[]
+  
+  @@index([status])
+  @@index([dealer])
+  @@index([expiryTimestamp])
+}
+
+enum DealStatus {
+  CREATED
+  LOCKED
+  ACTIVE
+  SETTLING
+  SETTLED
+  CANCELLED
+}
+
+// ===== Positions (LP deposits) =====
+model Position {
+  id              BigInt          @id
+  dealId          BigInt
+  deal            Deal            @relation(fields: [dealId], references: [id])
+  owner           String          // LP address
+  depositAmount   Decimal         @db.Decimal(78, 0)
+  chainId         BigInt          // Chain where deposit was made
+  claimed         Boolean         @default(false)
+  claimAmount     Decimal?        @db.Decimal(78, 0)
+  tokenAddress    String          // Token deposited
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  
+  // Remote vault tracking
+  remoteDeposit   RemoteDeposit?
+  
+  @@index([dealId])
+  @@index([owner])
+  @@index([chainId])
+  @@index([claimed])
+}
+
+// ===== Remote Vault Deposits =====
+model RemoteDeposit {
+  id              String          @id @default(cuid())
+  positionId      BigInt          @unique
+  position        Position        @relation(fields: [positionId], references: [id])
+  remoteChainId   BigInt          // Chain where deposit was made (e.g., Base)
+  hubChainId      BigInt          // Hub chain (Flare)
+  status          RemoteStatus    @default(PENDING)
+  hubPositionId   BigInt?         // Position ID on hub chain
+  txHash          String?         // Transaction hash
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  
+  @@index([status])
+  @@index([remoteChainId])
+}
+
+enum RemoteStatus {
+  PENDING
+  SENT
+  CONFIRMED
+  SETTLED
+  WITHDRAWN
+  FAILED
+}
+
+// ===== Nitrolite Channel States =====
+model ChannelState {
+  channelId       String          @id  // Nitrolite channel ID
+  dealId          BigInt          @unique
+  deal            Deal            @relation(fields: [dealId], references: [id])
+  stateHash       String          // Current state hash
+  version         BigInt          // State version (increments)
+  intent          StateIntent     // Current intent
+  
+  // Allocations (JSON for flexibility)
+  allocation0     Json            // { destination, token, amount }
+  allocation1     Json            // { destination, token, amount }
+  
+  // Signatures
+  signature0      String?         // Participant 0 signature
+  signature1      String?         // Participant 1 signature
+  
+  // Metadata
+  participants    Json            // [address0, address1]
+  stateData       String?         // Application data (hex)
+  
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  
+  // History
+  stateHistory    StateHistory[]
+  
+  @@index([dealId])
+  @@index([version])
+}
+
+enum StateIntent {
+  INITIALIZE
+  OPERATE
+  RESIZE
+  FINALIZE
+}
+
+// ===== Channel State History =====
+model StateHistory {
+  id              String          @id @default(cuid())
+  channelId       String
+  channelState    ChannelState    @relation(fields: [channelId], references: [channelId])
+  version         BigInt
+  stateHash       String
+  intent          StateIntent
+  allocation0     Json
+  allocation1     Json
+  signature0      String?
+  signature1      String?
+  stateData       String?
+  timestamp       DateTime        @default(now())
+  
+  @@index([channelId])
+  @@index([version])
+  @@index([timestamp])
+}
+
+// ===== Settlements =====
+model Settlement {
+  id              String          @id @default(cuid())
+  dealId          BigInt
+  deal            Deal            @relation(fields: [dealId], references: [id])
+  channelId       String?         // Associated channel
+  
+  // Settlement data
+  finalPrice      Decimal         @db.Decimal(30, 18)
+  priceSource     String          // e.g., "FTSO"
+  dealerFinal     Decimal         @db.Decimal(78, 0)
+  lpFinal         Decimal         @db.Decimal(78, 0)
+  
+  // Settlement proof
+  proofData       String?         // Encoded proof
+  txHash          String?         // Settlement transaction hash
+  
+  status          SettlementStatus @default(PENDING)
+  createdAt       DateTime        @default(now())
+  settledAt       DateTime?
+  
+  @@index([dealId])
+  @@index([status])
+}
+
+enum SettlementStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ===== Price History (FTSO) =====
+model PriceHistory {
+  id              String          @id @default(cuid())
+  tokenSymbol     String          // e.g., "BTC", "ETH"
+  tokenAddress    String?         // Token contract address
+  price           Decimal         @db.Decimal(30, 18)
+  source          String          @default("FTSO")
+  chainId         BigInt          // Chain where price was fetched
+  blockNumber     BigInt?
+  timestamp       DateTime        @default(now())
+  
+  @@index([tokenSymbol, timestamp])
+  @@index([timestamp])
+}
+
+// ===== Transaction Queue =====
+model TransactionQueue {
+  id              String          @id @default(cuid())
+  chainId         BigInt
+  to              String          // Contract address
+  data            String          // Calldata
+  value           String          @default("0")
+  gasLimit        String?
+  priority        Int             @default(0)
+  status          TxStatus        @default(PENDING)
+  txHash          String?
+  blockNumber     BigInt?
+  error           String?
+  retryCount      Int             @default(0)
+  maxRetries      Int             @default(3)
+  createdAt       DateTime        @default(now())
+  processedAt     DateTime?
+  
+  @@index([status, priority])
+  @@index([chainId])
+}
+
+enum TxStatus {
+  PENDING
+  PROCESSING
+  CONFIRMED
+  FAILED
+}
+
+// ===== Event Logs =====
+model EventLog {
+  id              String          @id @default(cuid())
+  chainId         BigInt
+  contractAddress String
+  eventName       String
+  blockNumber     BigInt
+  txHash          String
+  logIndex        Int
+  data            Json            // Event data
+  processed       Boolean         @default(false)
+  timestamp       DateTime        @default(now())
+  
+  @@unique([chainId, txHash, logIndex])
+  @@index([contractAddress, eventName])
+  @@index([processed])
+  @@index([timestamp])
+}
